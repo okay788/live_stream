@@ -1,9 +1,7 @@
 // server.js
-// ---------------------------------------------------------------
 // RTMP ingest -> ffmpeg (copy mode) -> HLS segments (stream.m3u8)
 // Node-Media-Server serves HLS on port 8000
 // Express UI + master playlist on port 8100
-// No transcoding / no quality changes. Just segment & distribute.
 // ---------------------------------------------------------------
 
 const NodeMediaServer = require("node-media-server");
@@ -12,7 +10,7 @@ const express = require("express");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
-const cors=requrie("cors");
+const cors = require("cors"); // <-- fixed typo
 
 // ---------------- CONFIG ----------------
 const RTMP_PORT = 1935;
@@ -38,7 +36,7 @@ const nmsConfig = {
   http: {
     port: NMS_HTTP_PORT,
     mediaroot: MEDIA_ROOT,
-    allow_origin: "*",
+    allow_origin: "*", // NodeMediaServer will add this header for its own http server
   },
 };
 
@@ -84,16 +82,13 @@ function startTranscode(streamKey) {
 
   const input = `rtmp://127.0.0.1:${RTMP_PORT}/live/${streamKey}`;
 
-  // *** NO TRANSCODING — JUST COPY ***
   const args = [
     "-hide_banner",
     "-y",
     "-i",
     input,
-
     "-c",
-    "copy", // very important! no format change
-
+    "copy", // copy codec
     "-f",
     "hls",
     "-hls_time",
@@ -104,7 +99,6 @@ function startTranscode(streamKey) {
     "delete_segments+append_list",
     "-hls_segment_filename",
     path.join(outDir, "segment_%03d.ts"),
-
     path.join(outDir, "stream.m3u8"),
   ];
 
@@ -153,9 +147,28 @@ nms.on("donePublish", (id, StreamPath, args) => {
 
 // ---------------- EXPRESS UI SERVER ----------------
 const app = express();
+
+// enable CORS for all express routes (this will add Access-Control-Allow-Origin: * )
+app.use(cors());
+
+// serve UI
 app.use(express.static(PUBLIC_DIR));
 
-// expose media folder (optional)
+// expose media folder and ensure CORS headers for static media too
+// (cors() above should handle this, but this guarantees the important expose headers)
+app.use("/media", (req, res, next) => {
+  // allow any origin to fetch .m3u8 and .ts
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept, Range"
+  );
+  res.header("Access-Control-Expose-Headers", "Content-Length, Accept-Ranges");
+  res.header("Accept-Ranges", "bytes");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 app.use("/media", express.static(MEDIA_ROOT));
 
 // Generate random key
@@ -168,11 +181,13 @@ app.get("/api/generate", (_, res) => {
 });
 
 // Master playlist (simple — 1 stream only)
+// NOTE: Construct URL to the Express /media route on the EXPRESS_PORT so browser requests the same origin/port we serve files from
 app.get("/stream/:key/master.m3u8", (req, res) => {
   const key = req.params.key;
 
-  const host = req.hostname.split(":")[0]; // remove express port
-  const streamUrl = `${req.protocol}://${host}:${NMS_HTTP_PORT}/${key}/stream.m3u8`;
+  // Use host header so it works behind proxies and when accessing by IP
+  const host = req.get("host").split(":")[0];
+  const streamUrl = `${req.protocol}://${host}:${EXPRESS_PORT}/media/${key}/stream.m3u8`;
 
   const master = `#EXTM3U
 #EXT-X-VERSION:3
@@ -181,6 +196,8 @@ ${streamUrl}
 `;
 
   res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+  // ensure CORS on this response too
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.send(master);
 });
 
@@ -189,7 +206,8 @@ app.listen(EXPRESS_PORT, () => {
   console.log(`------------------------------------------`);
   console.log(`Express UI: http://localhost:${EXPRESS_PORT}`);
   console.log(`RTMP ingest (OBS): rtmp://<SERVER_IP>:${RTMP_PORT}/live/<KEY>`);
-  console.log(`HLS output: http://<SERVER_IP>:${NMS_HTTP_PORT}/<KEY>/stream.m3u8`);
+  console.log(`HLS output (via Express): http://<SERVER_IP>:${EXPRESS_PORT}/media/<KEY>/stream.m3u8`);
+  console.log(`HLS output (NMS http): http://<SERVER_IP>:${NMS_HTTP_PORT}/<KEY>/stream.m3u8`);
   console.log(`Master playlist: http://<SERVER_IP>:${EXPRESS_PORT}/stream/<KEY>/master.m3u8`);
   console.log(`------------------------------------------`);
 });
