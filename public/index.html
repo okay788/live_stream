@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Streamer UI</title>
+  <style>
+    body { font-family: system-ui, Arial; padding: 24px; max-width:700px; margin:auto; }
+    input { padding:8px; width:70%; }
+    button { padding:8px 12px; margin-left:8px; }
+    .hint { margin-top:12px; color:#555; }
+  </style>
+</head>
+<body>
+  <h1>Simple RTMP → HLS demo</h1>
+  <p>
+    Click to generate a stream key for OBS, then in OBS use:
+  </p>
+  <pre>URL: rtmp://&lt;SERVER_IP&gt;:1935/live
+Stream Key: &lt;your-key&gt;</pre>
+
+  <button id="gen">Generate stream key</button>
+  <div id="out" style="margin-top:12px"></div>
+
+  <p class="hint">After publishing from OBS open <a href="live.html">Live Viewer</a> and enter the same stream key.</p>
+
+  <script>
+    document.getElementById('gen').addEventListener('click', async () => {
+      const res = await fetch('/api/generate');
+      const json = await res.json();
+      document.getElementById('out').innerHTML = `<strong>streamKey:</strong> ${json.streamKey} <br><strong>RTMP URL:</strong> rtmp://<your-server-ip>:1935/live/${json.streamKey}`;
+    });
+  </script>
+</body>
+</html>

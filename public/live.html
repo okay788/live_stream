@@ -1,0 +1,76 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Live Viewer</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial; padding: 18px; max-width:900px; margin:auto; }
+    video { width:100%; max-height:70vh; background: #000; }
+    .controls { margin-top:10px; display:flex; gap:8px; align-items:center; }
+    input[type=text] { padding:8px; flex:1; }
+    button { padding:8px 12px; }
+    #status { color:#444; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <h1>Live Viewer</h1>
+  <p>Enter the stream key you used in OBS (e.g. <code>af53d72d3b96</code>) then click <strong>Start</strong>.</p>
+
+  <div class="controls">
+    <input id="key" placeholder="stream key (e.g. stream1)">
+    <button id="start">Start</button>
+    <select id="quality">
+      <option value="master">Auto (master)</option>
+      <option value="480">480p</option>
+      <option value="720">720p</option>
+      <option value="1080">1080p</option>
+    </select>
+  </div>
+
+  <div id="status">Status: idle</div>
+  <video id="video" controls playsinline></video>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.5/dist/hls.min.js"></script>
+  <script>
+    const startBtn = document.getElementById('start');
+    const keyInput = document.getElementById('key');
+    const qualitySelect = document.getElementById('quality');
+    const statusEl = document.getElementById('status');
+    const video = document.getElementById('video');
+    const EXPRESS_PORT = location.port || '8100';
+    const NMS_HTTP_PORT = 8000;
+    let hls = null;
+    let currentUrl = null;
+    function logStatus(t){ statusEl.textContent = 'Status: ' + t; console.log('[LiveViewer]', t); }
+    function masterUrl(key){ return `${location.protocol}//${location.hostname}:${EXPRESS_PORT}/stream/${key}/master.m3u8`; }
+    function variantUrl(key,q){ return `${location.protocol}//${location.hostname}:${NMS_HTTP_PORT}/${key}/${q}.m3u8`; }
+    async function exists(url){
+      try { const r = await fetch(url, { method: 'HEAD' }); return r.ok; } catch(e){ return false; }
+    }
+    async function startPlayback(){
+      const key = keyInput.value.trim(); if(!key){ logStatus('enter a stream key'); return; }
+      const q = qualitySelect.value;
+      let url = q==='master' ? masterUrl(key) : variantUrl(key, q);
+      logStatus('Trying ' + url);
+      // destroy old
+      if (hls) { try { hls.destroy(); } catch(e){} hls=null; }
+      video.pause(); video.removeAttribute('src'); video.load();
+      if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = url; video.play().catch(()=>{}); logStatus('Playing (native HLS)');
+      } else if (Hls.isSupported()) {
+        hls = new Hls();
+        hls.on(Hls.Events.ERROR, (ev, data) => {
+          console.warn('HLS error', ev, data);
+          logStatus('HLS error: ' + (data && data.details));
+        });
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, ()=>{ video.play().catch(()=>{}); logStatus('Playing (hls.js)'); });
+      } else logStatus('HLS not supported');
+    }
+    startBtn.addEventListener('click', startPlayback);
+    qualitySelect.addEventListener('change', ()=>{ if (keyInput.value.trim()) startPlayback(); });
+  </script>
+</body>
+</html>
