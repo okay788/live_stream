@@ -67,13 +67,10 @@ function extractKey(StreamPath, args, session) {
 
 // ---------------- START FFMPEG (TRANSCODE to 720p H264 + AAC) ----------------
 /*
-  Explanation of chosen settings:
-  - video: libx264, profile main, scale to 1280x720 (preserve aspect by padding/cropping not used here)
-  - target bitrate / buffer: tuned for typical 720p output
-  - crf + maxrate: controls quality and bandwidth
-  - audio: aac 128kbps stereo
-  - hls_time: 2s segments, hls_list_size: 6 segments in playlist
-  - hls_flags: delete_segments+append_list to keep rolling window
+  Notes on changes:
+  - Replaced -x264-params with cross-platform flags (-g, -sc_threshold).
+  - Added -pix_fmt yuv420p for wide compatibility.
+  - Kept CRF / maxrate / bufsize settings; adjust as needed.
 */
 function startTranscode(streamKey) {
   if (!streamKey) return;
@@ -93,7 +90,11 @@ function startTranscode(streamKey) {
 
   const input = `rtmp://127.0.0.1:${RTMP_PORT}/live/${streamKey}`;
 
-  // FFmpeg args: transcode to 1280x720 h264/aac and create HLS
+  // --- IMPORTANT: adjust GOP (-g) based on input fps.
+  // If your encoder sends 60 fps, consider -g 120 for ~2s GOP. If 30 fps, -g 60.
+  // Here we pick -g 120 (works for 60fps input), but it's fine if slightly off.
+  const gop = "120";
+
   const args = [
     "-hide_banner",
     "-y",
@@ -101,12 +102,14 @@ function startTranscode(streamKey) {
 
     // Video encoding
     "-c:v", "libx264",
-    "-preset", "veryfast",         // tune for speed vs quality
+    "-preset", "veryfast",
     "-profile:v", "main",
-    "-vf", "scale=w=1280:h=720:force_original_aspect_ratio=decrease", // scale down/up keeping aspect
-    "-x264-params", "keyint=48:min-keyint=48:no-scenecut", // keyint tuned for 24fps->48 = 2s
-    "-crf", "23",                 // quality (lower -> better quality/larger)
-    "-maxrate", "3000k",          // cap peak bitrate
+    "-vf", "scale=w=1280:h=720:force_original_aspect_ratio=decrease",
+    "-pix_fmt", "yuv420p",
+    "-g", gop,               // GOP / keyframe interval
+    "-sc_threshold", "0",    // disable scene cut so ffmpeg honors -g (like no-scenecut)
+    "-crf", "23",
+    "-maxrate", "3000k",
     "-bufsize", "6000k",
 
     // Audio encoding
@@ -116,8 +119,8 @@ function startTranscode(streamKey) {
 
     // HLS muxing options
     "-f", "hls",
-    "-hls_time", "2",             // 2s segments
-    "-hls_list_size", "6",        // keep last 6 segments in playlist
+    "-hls_time", "2",
+    "-hls_list_size", "6",
     "-hls_flags", "delete_segments+append_list",
     "-hls_segment_filename", path.join(outDir, "segment_%03d.ts"),
     path.join(outDir, "stream.m3u8"),
@@ -226,7 +229,7 @@ app.get("/player/:key", (req, res) => {
   <style>body{background:#111;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}video{width:80%;max-width:960px}</style>
 </head>
 <body>
-  <video id="video" controls></video>
+  <video id="video" controls crossorigin="anonymous"></video>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <script>
     const video = document.getElementById('video');
@@ -236,7 +239,6 @@ app.get("/player/:key", (req, res) => {
       hls.loadSource(url);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, function() {
-        // don't autoplay in many browsers, just show the player
         console.log('manifest parsed');
       });
       hls.on(Hls.Events.ERROR, (event, data) => {
