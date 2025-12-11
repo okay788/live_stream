@@ -1,21 +1,191 @@
-<video id="video" controls></video>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-<script>
-  const url = 'http://210.79.128.219:8100/media/42470a086e50/stream.m3u8';
-  const video = document.getElementById('video');
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>HLS Multi-Key Player</title>
+  <style>
+    body { background:#0b0b0b; color:#eee; font-family:system-ui,Segoe UI,Roboto,Arial; padding:20px }
+    .wrap { max-width:980px; margin:0 auto }
+    .controls { display:flex; gap:8px; margin-bottom:12px; align-items:center; flex-wrap:wrap }
+    input, select, button { padding:8px 10px; font-size:14px; border-radius:6px; border:1px solid #2b2b2b; background:#111; color:#eee }
+    button { cursor:pointer }
+    video { width:100%; background:#000; border-radius:6px; box-shadow:0 6px 18px rgba(0,0,0,.6); }
+    #log { margin-top:10px; background:#070707; padding:8px; border-radius:6px; height:140px; overflow:auto; font-family:monospace; font-size:12px }
+    label { font-size:13px; color:#bbb; margin-right:6px }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>HLS Player — enter stream key or full URL</h2>
 
-  if (Hls.isSupported()) {
-    const hls = new Hls();
-    hls.loadSource(url);
-    hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => {
-      console.log('manifest parsed');
-      //video.play();
+    <div class="controls">
+      <label>Host (protocol + host[:port])</label>
+      <input id="host" value="http://210.79.128.219:8100" style="width:300px" />
+      <label>Stream Key</label>
+      <input id="key" placeholder="enter stream key (e.g. 95e1151fb58f)" style="width:260px" />
+      <label>Or Full HLS URL</label>
+      <input id="fullUrl" placeholder="optional: full stream.m3u8 URL (overrides host+key)" style="width:420px" />
+
+      <button id="playBtn">Play</button>
+      <button id="stopBtn">Stop</button>
+      <button id="copyBtn">Copy HLS URL</button>
+      <button id="openBtn">Open in new tab</button>
+    </div>
+
+    <video id="video" controls crossorigin="anonymous" playsinline></video>
+
+    <div id="log"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script>
+    const hostInput = document.getElementById('host');
+    const keyInput = document.getElementById('key');
+    const fullInput = document.getElementById('fullUrl');
+    const playBtn = document.getElementById('playBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const copyBtn = document.getElementById('copyBtn');
+    const openBtn = document.getElementById('openBtn');
+    const logEl = document.getElementById('log');
+
+    const video = document.getElementById('video');
+    let hls = null;
+    let currentUrl = '';
+
+    const log = (...args) => {
+      const t = new Date().toLocaleTimeString();
+      logEl.innerText = `${t} — ${args.join(' ')}\n` + logEl.innerText;
+      console.log(...args);
+    };
+
+    function buildUrl() {
+      const full = fullInput.value.trim();
+      if (full) return full;
+      const host = hostInput.value.trim().replace(/\/+$/, '');
+      const key = keyInput.value.trim();
+      if (!host || !key) return null;
+      // standard path served by Express in our server: /media/<key>/stream.m3u8
+      return `${host}/media/${encodeURIComponent(key)}/stream.m3u8`;
+    }
+
+    async function checkUrl(u) {
+      try {
+        const r = await fetch(u, { method:'GET', mode:'cors', cache:'no-store' });
+        log('HEAD/GET', u, 'status', r.status);
+        // report relevant headers
+        const ac = r.headers.get('access-control-allow-origin');
+        const ar = r.headers.get('accept-ranges');
+        const ct = r.headers.get('content-type');
+        log('headers:', 'access-control-allow-origin=' + ac, 'accept-ranges=' + ar, 'content-type=' + ct);
+        return r.ok;
+      } catch (err) {
+        log('fetch error', err.message);
+        return false;
+      }
+    }
+
+    async function start(url) {
+      if (!url) { log('No URL'); return; }
+      currentUrl = url;
+
+      // quick availability/CORS check
+      const ok = await checkUrl(url);
+      if (!ok) {
+        log('Playlist unreachable or blocked by CORS. Check server headers and that the URL is correct.');
+        return;
+      }
+
+      stop(); // ensure previous instance cleaned
+
+      if (Hls.isSupported()) {
+        hls = new Hls({
+          // tweak as needed
+          maxBufferLength: 30,
+          maxMaxBufferLength: 60,
+        });
+
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          log('MANIFEST_PARSED — ready to play');
+          // don't force autoplay; the user can press play
+        });
+
+        hls.on(Hls.Events.ERROR, (event, data) => {
+          log('HLS error', data.type, data.details, data.fatal ? 'FATAL' : 'non-fatal');
+          if (data.fatal) {
+            if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              log('Trying recoverMediaError()');
+              hls.recoverMediaError();
+            } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              log('Network error — trying startLoad()');
+              hls.startLoad();
+            } else {
+              log('Destroying hls instance');
+              hls.destroy();
+              hls = null;
+            }
+          }
+        });
+
+        hls.loadSource(url);
+        hls.attachMedia(video);
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = url;
+      } else {
+        log('Browser has no HLS support');
+      }
+
+      log('Started loading', url);
+    }
+
+    function stop() {
+      if (hls) {
+        try { hls.destroy(); } catch(e){}
+        hls = null;
+      }
+      try { video.pause(); } catch(e){}
+      video.removeAttribute('src');
+      video.load();
+      log('Stopped playback');
+    }
+
+    playBtn.addEventListener('click', async () => {
+      const u = buildUrl();
+      if (!u) { log('Enter host and key, or full URL'); return; }
+      await start(u);
     });
-    hls.on(Hls.Events.ERROR, (e,d) => console.error('hls error', e, d));
-  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = url; // Safari only
-  } else {
-    console.error('No HLS support');
-  }
-</script>
+    stopBtn.addEventListener('click', stop);
+
+    copyBtn.addEventListener('click', () => {
+      const u = buildUrl();
+      if (!u) { log('No URL to copy'); return; }
+      navigator.clipboard?.writeText(u).then(()=> log('Copied URL to clipboard:', u)).catch(e=>log('Copy failed', e.message));
+    });
+
+    openBtn.addEventListener('click', () => {
+      const u = buildUrl();
+      if (!u) { log('No URL to open'); return; }
+      window.open(u, '_blank');
+    });
+
+    // optional: allow Enter key to trigger Play from key input
+    keyInput.addEventListener('keydown', (e)=> { if (e.key === 'Enter') playBtn.click(); });
+    fullInput.addEventListener('keydown', (e)=> { if (e.key === 'Enter') playBtn.click(); });
+
+    // load last used values (localStorage)
+    try {
+      hostInput.value = localStorage.getItem('hls_host') || hostInput.value;
+      keyInput.value = localStorage.getItem('hls_key') || '';
+      fullInput.value = localStorage.getItem('hls_full') || '';
+    } catch(e){}
+
+    // persist changes
+    [hostInput, keyInput, fullInput].forEach(inp => inp.addEventListener('change', () => {
+      try {
+        localStorage.setItem('hls_host', hostInput.value);
+        localStorage.setItem('hls_key', keyInput.value);
+        localStorage.setItem('hls_full', fullInput.value);
+      } catch(e){}
+    }));
+  </script>
+</body>
+</html>

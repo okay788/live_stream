@@ -1,7 +1,7 @@
 // server.js
-// RTMP ingest -> ffmpeg (copy mode) -> HLS segments (stream.m3u8)
-// Node-Media-Server serves HLS on port 8000
-// Express UI + master playlist on port 8100
+// RTMP ingest -> ffmpeg (transcode to 720p) -> HLS segments (stream.m3u8)
+// Node-Media-Server serves RTMP and also writes files under ./media
+// Express UI + HLS serving + test player on port 8100
 // ---------------------------------------------------------------
 
 const NodeMediaServer = require("node-media-server");
@@ -10,12 +10,12 @@ const express = require("express");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
-const cors = require("cors"); // <-- fixed typo
+const cors = require("cors");
 
 // ---------------- CONFIG ----------------
 const RTMP_PORT = 1935;
-const NMS_HTTP_PORT = 8000;
-const EXPRESS_PORT = 8100;
+const NMS_HTTP_PORT = 8000; // NodeMediaServer internal http (optional)
+const EXPRESS_PORT = 8100;  // Express will serve UI and media
 
 const PROJECT_ROOT = __dirname;
 const PUBLIC_DIR = path.join(PROJECT_ROOT, "public");
@@ -36,7 +36,7 @@ const nmsConfig = {
   http: {
     port: NMS_HTTP_PORT,
     mediaroot: MEDIA_ROOT,
-    allow_origin: "*", // NodeMediaServer will add this header for its own http server
+    allow_origin: "*", // NodeMediaServer's internal http server will add this header
   },
 };
 
@@ -65,7 +65,16 @@ function extractKey(StreamPath, args, session) {
   return null;
 }
 
-// ---------------- START FFMPEG (COPY MODE — NO RE-ENCODE) ----------------
+// ---------------- START FFMPEG (TRANSCODE to 720p H264 + AAC) ----------------
+/*
+  Explanation of chosen settings:
+  - video: libx264, profile main, scale to 1280x720 (preserve aspect by padding/cropping not used here)
+  - target bitrate / buffer: tuned for typical 720p output
+  - crf + maxrate: controls quality and bandwidth
+  - audio: aac 128kbps stereo
+  - hls_time: 2s segments, hls_list_size: 6 segments in playlist
+  - hls_flags: delete_segments+append_list to keep rolling window
+*/
 function startTranscode(streamKey) {
   if (!streamKey) return;
   if (activeTranscoders.has(streamKey)) return;
@@ -73,41 +82,52 @@ function startTranscode(streamKey) {
   const outDir = streamOutputDir(streamKey);
   ensureDir(outDir);
 
-  // Cleanup old segments
+  // Cleanup old segments (be careful in production)
   try {
     fs.readdirSync(outDir).forEach((f) =>
       fs.unlinkSync(path.join(outDir, f))
     );
-  } catch {}
+  } catch (err) {
+    // ignore
+  }
 
   const input = `rtmp://127.0.0.1:${RTMP_PORT}/live/${streamKey}`;
 
+  // FFmpeg args: transcode to 1280x720 h264/aac and create HLS
   const args = [
     "-hide_banner",
     "-y",
-    "-i",
-    input,
-    "-c",
-    "copy", // copy codec
-    "-f",
-    "hls",
-    "-hls_time",
-    "2",
-    "-hls_list_size",
-    "6",
-    "-hls_flags",
-    "delete_segments+append_list",
-    "-hls_segment_filename",
-    path.join(outDir, "segment_%03d.ts"),
+    "-i", input,
+
+    // Video encoding
+    "-c:v", "libx264",
+    "-preset", "veryfast",         // tune for speed vs quality
+    "-profile:v", "main",
+    "-vf", "scale=w=1280:h=720:force_original_aspect_ratio=decrease", // scale down/up keeping aspect
+    "-x264-params", "keyint=48:min-keyint=48:no-scenecut", // keyint tuned for 24fps->48 = 2s
+    "-crf", "23",                 // quality (lower -> better quality/larger)
+    "-maxrate", "3000k",          // cap peak bitrate
+    "-bufsize", "6000k",
+
+    // Audio encoding
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-ac", "2",
+
+    // HLS muxing options
+    "-f", "hls",
+    "-hls_time", "2",             // 2s segments
+    "-hls_list_size", "6",        // keep last 6 segments in playlist
+    "-hls_flags", "delete_segments+append_list",
+    "-hls_segment_filename", path.join(outDir, "segment_%03d.ts"),
     path.join(outDir, "stream.m3u8"),
   ];
 
-  console.log(`[FFMPEG] Starting copy-segmentation for key=${streamKey}`);
-
+  console.log(`[FFMPEG] Starting transcode->HLS for key=${streamKey}`);
   const ff = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
 
   ff.stderr.on("data", (d) => {
-    console.log(`[ffmpeg ${streamKey}] ${d.toString()}`);
+    process.stdout.write(`[ffmpeg ${streamKey}] ${d.toString()}`);
   });
 
   ff.on("close", (code) => {
@@ -123,7 +143,7 @@ function stopTranscode(streamKey) {
   if (ff) {
     try {
       ff.kill("SIGINT");
-    } catch {}
+    } catch (err) { /* ignore */ }
     activeTranscoders.delete(streamKey);
   }
 }
@@ -145,19 +165,17 @@ nms.on("donePublish", (id, StreamPath, args) => {
   stopTranscode(streamKey);
 });
 
-// ---------------- EXPRESS UI SERVER ----------------
+// ---------------- EXPRESS UI & MEDIA SERVER ----------------
 const app = express();
 
-// enable CORS for all express routes (this will add Access-Control-Allow-Origin: * )
+// enable CORS for all express routes (adds Access-Control-Allow-Origin: *)
 app.use(cors());
 
-// serve UI
+// serve static UI (if you have files in /public)
 app.use(express.static(PUBLIC_DIR));
 
-// expose media folder and ensure CORS headers for static media too
-// (cors() above should handle this, but this guarantees the important expose headers)
+// explicit CORS and range headers for /media (important for .m3u8 and .ts)
 app.use("/media", (req, res, next) => {
-  // allow any origin to fetch .m3u8 and .ts
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
   res.header(
@@ -176,38 +194,79 @@ app.get("/api/generate", (_, res) => {
   const key = crypto.randomBytes(6).toString("hex");
   res.json({
     streamKey: key,
-    rtmpUrl: `rtmp://your-host-ip-or-domain:${RTMP_PORT}/live/${key}`,
+    rtmpUrl: `rtmp://<SERVER_IP_OR_DOMAIN>:${RTMP_PORT}/live/${key}`,
+    hlsUrl: `http://<SERVER_IP_OR_DOMAIN>:${EXPRESS_PORT}/media/${key}/stream.m3u8`
   });
 });
 
-// Master playlist (simple — 1 stream only)
-// NOTE: Construct URL to the Express /media route on the EXPRESS_PORT so browser requests the same origin/port we serve files from
+// Master playlist (optional) — points to the per-stream playlist served by Express
 app.get("/stream/:key/master.m3u8", (req, res) => {
   const key = req.params.key;
-
-  // Use host header so it works behind proxies and when accessing by IP
   const host = req.get("host").split(":")[0];
   const streamUrl = `${req.protocol}://${host}:${EXPRESS_PORT}/media/${key}/stream.m3u8`;
-
   const master = `#EXTM3U
 #EXT-X-VERSION:3
-#EXT-X-STREAM-INF:BANDWIDTH=0
+#EXT-X-STREAM-INF:BANDWIDTH=3000000
 ${streamUrl}
 `;
-
   res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-  // ensure CORS on this response too
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.send(master);
 });
 
-// Start Express UI
+// Simple test player (uses hls.js for browsers that need MSE)
+app.get("/player/:key", (req, res) => {
+  const key = req.params.key;
+  const hlsUrl = `${req.protocol}://${req.get("host")}/media/${key}/stream.m3u8`;
+  const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>HLS Player - ${key}</title>
+  <style>body{background:#111;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}video{width:80%;max-width:960px}</style>
+</head>
+<body>
+  <video id="video" controls></video>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script>
+    const video = document.getElementById('video');
+    const url = '${hlsUrl}';
+    if (Hls.isSupported()) {
+      const hls = new Hls();
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, function() {
+        // don't autoplay in many browsers, just show the player
+        console.log('manifest parsed');
+      });
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        console.error('HLS error', event, data);
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url;
+    } else {
+      document.body.innerHTML = '<p style="color:#f88">Your browser does not support HLS playback.</p>';
+    }
+  </script>
+</body>
+</html>`;
+  res.send(html);
+});
+
+// helper to show current active keys
+app.get("/status", (req, res) => {
+  const keys = fs.readdirSync(MEDIA_ROOT, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .map(d => d.name);
+  res.json({ activeStreamDirs: keys, transcoding: Array.from(activeTranscoders.keys()) });
+});
+
+// Start Express
 app.listen(EXPRESS_PORT, () => {
   console.log(`------------------------------------------`);
   console.log(`Express UI: http://localhost:${EXPRESS_PORT}`);
   console.log(`RTMP ingest (OBS): rtmp://<SERVER_IP>:${RTMP_PORT}/live/<KEY>`);
   console.log(`HLS output (via Express): http://<SERVER_IP>:${EXPRESS_PORT}/media/<KEY>/stream.m3u8`);
-  console.log(`HLS output (NMS http): http://<SERVER_IP>:${NMS_HTTP_PORT}/<KEY>/stream.m3u8`);
-  console.log(`Master playlist: http://<SERVER_IP>:${EXPRESS_PORT}/stream/<KEY>/master.m3u8`);
+  console.log(`Test player: http://<SERVER_IP>:${EXPRESS_PORT}/player/<KEY>`);
   console.log(`------------------------------------------`);
 });
