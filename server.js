@@ -12,6 +12,7 @@ const express = require("express");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const cors=requrie("cors");
 
 // ---------------- CONFIG ----------------
 const RTMP_PORT = 1935;
